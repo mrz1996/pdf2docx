@@ -75,7 +75,8 @@ class TextSpan(Element):
         '''
         # process on '+' and '-'
         font_name = self._font.split('+')[-1]
-        #font_name = font_name.split('-')[0]
+        # 修复方正系列字体转换问题
+        # font_name = font_name.split('-')[0]
 
         # mapping font name
         key = font_name.replace(' ', '').replace('-', '').replace('_', '').upper() # normalize mapping key
