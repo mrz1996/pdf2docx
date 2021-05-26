@@ -5,6 +5,7 @@
 *.docx
 layout.json
 .vscode/
+!version.txt
 
 # pdf testing files
 *.pdf
