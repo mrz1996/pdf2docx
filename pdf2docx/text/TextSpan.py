@@ -11,7 +11,7 @@ this `link <https://pymupdf.readthedocs.io/en/latest/textpage.html>`_::
         'bbox': (x0,y0,x1,y1),
         'color': sRGB
         'font': fontname,
-        'size': fontzise,
+        'size': fontsize,
         'flags': fontflags,
         'chars': [ chars ],
 
@@ -30,10 +30,8 @@ this `link <https://pymupdf.readthedocs.io/en/latest/textpage.html>`_::
 '''
 
 import fitz
-
 from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
-
 from .Char import Char
 from ..common.Element import Element
 from ..common.share import RectType
@@ -45,54 +43,33 @@ from ..shape.Shape import Shape
 class TextSpan(Element):
     '''Object representing text span.'''
     def __init__(self, raw:dict=None):
-        if raw is None: raw = {}
+        raw = raw or {}
         self.color = raw.get('color', 0)
-        self._font = raw.get('font', '')
+        self.font = raw.get('font', '')
         self.size = raw.get('size', 12.0)
+        self.line_height = raw.get('line_height', 1.2*self.size)
         self.flags = raw.get('flags', 0)
+        self._text = raw.get('text', '') # "text" is not an original key from PyMuPDF
         self.chars = [ Char(c) for c in raw.get('chars', []) ] # type: list[Char]
 
         # introduced attributes
         # a list of dict: { 'type': int, 'color': int }
         self.style = raw.get('style', [])
+
+        # charater spacing
+        self.char_spacing = raw.get('char_spacing', 0.0)
         
         # init text span element
         super().__init__(raw)
-
-        # update bbox if no font is set
-        if 'UNNAMED' in self.font.upper(): self.set_font('Arial')        
-
-
-    @property
-    def font(self):
-        '''Parse raw font name, e.g. 
-        
-        * Split with ``+`` and ``-``: BCDGEE+Calibri-Bold, BCDGEE+Calibri -> Calibri.
-        * Split with upper case : ArialNarrow -> Arial Narrow, but exception: NSimSUN -> NSimSUN.
-        * Replace ``,`` with blank: e.g. Ko Pub Dotum, Light -> KoPubDotum Light.
-        
-        NSimSUN refers to Chinese font name `新宋体`, so consider a localization mapping.
-        '''
-        # process on '+' and '-'
-        font_name = self._font.split('+')[-1]
-        # 修复方正系列字体转换问题
-        # font_name = font_name.split('-')[0]
-
-        # mapping font name
-        key = font_name.replace(' ', '').replace('-', '').replace('_', '').upper() # normalize mapping key
-        font_name = constants.DICT_FONTS.get(key, font_name)
-
-        # replace ','
-        font_name = font_name.replace(',', ' ')
-
-        return font_name
+        # in rare case, the font is unamed, so change font and update bbox accordingly
+        if 'UNNAMED' in self.font.upper():
+            self._change_font_and_update_bbox(constants.DEFAULT_FONT_NAME)
 
 
     @property
     def text(self):
-        '''Joining chars in text span'''
-        chars = [char.c for char in self.chars]        
-        return ''.join(chars)
+        '''Get span text. Note joining chars is in a higher priority.'''
+        return ''.join([char.c for char in self.chars]) if self.chars else self._text
 
     
     def cal_bbox(self):
@@ -102,7 +79,7 @@ class TextSpan(Element):
         return bbox
 
 
-    def set_font(self, fontname):
+    def _change_font_and_update_bbox(self, font_name:str='Times New Roman'):
         '''Set new font, and update font size, span/char bbox accordingly.
 
         It's generally used for span with unnamed fonts. 
@@ -116,13 +93,14 @@ class TextSpan(Element):
         ``fitz.TextWriter``.
 
         Args:
-            fontname (str): Font name.
+            font_name (str): Font name.
+            line_height (float): line height.
         '''
-        # set new font
-        font = fitz.Font(fontname)
-        self._font = fontname
+        # set new font property
+        self.font = font_name
 
         # compute text length under new font with that size
+        font = fitz.Font(font_name)
         new_length = font.text_length(self.text, fontsize=self.size)
         if new_length > self.bbox.width:
             self.size *= self.bbox.width / new_length
@@ -187,13 +165,12 @@ class TextSpan(Element):
             'color': self.color,
             'font': self.font,
             'size': self.size,
+            'line_height': self.line_height, 
             'flags': self.flags,
-            'chars': [
-                char.store() for char in self.chars
-            ],
             'text': self.text,
-            'style': self.style
-        })
+            'style': self.style,
+            'char_spacing': self.char_spacing
+        }) # not storing chars for space saving
         return res
 
 
@@ -386,6 +363,10 @@ class TextSpan(Element):
         # set text style, e.g. font, underline and highlight
         self._set_text_format(docx_run)
 
+        # condense charaters to avoid potential line break
+        if self.char_spacing:
+            docx.set_char_spacing(docx_run, self.char_spacing)
+
 
     def _set_text_format(self, docx_run):
         '''Set text format for ``python-docx.run`` object.'''
@@ -441,5 +422,3 @@ class TextSpan(Element):
             # same color with text for strike line
             elif t==RectType.STRIKE.value:
                 docx_run.font.strike = True
-
-        

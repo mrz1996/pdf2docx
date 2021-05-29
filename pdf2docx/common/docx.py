@@ -18,8 +18,48 @@ from . import constants
 
 
 # ---------------------------------------------------------
-# paragraph
+# section and paragraph
 # ---------------------------------------------------------
+def set_equal_columns(section, num=2, space=0):
+    """Set section column count and space. All the columns have same width.
+
+    Args:
+        section : ``python-docx`` Section instance.
+        num (int): Column count. Defaults to 2.
+        space (int, optional): Space between adjacent columns. Unit: Pt. Defaults to 0.
+    """
+    col = section._sectPr.xpath('./w:cols')[0]
+    col.set(qn('w:num'), str(num))
+    col.set(qn('w:space'), str(int(20*space))) # basic unit 1/20 Pt
+
+
+def set_columns(section, width_list:list, space=0):
+    """Set section column count and space.
+
+    Args:
+        section : ``python-docx`` Section instance.
+        width_list (list|tuple): Width of each column.
+        space (int, optional): Space between adjacent columns. Unit: Pt. Defaults to 0.
+    
+    Scheme::
+        <w:cols w:num="2" w:space="0" w:equalWidth="0">
+            <w:col w:w="2600" w:space="0"/>
+            <w:col w:w="7632"/>
+        </w:cols>
+    """
+    cols = section._sectPr.xpath('./w:cols')[0]
+    cols.set(qn('w:num'), str(len(width_list)))    
+    cols.set(qn('w:equalWidth'), '0')
+
+    # insert column with width
+    # default col exists in cols, so insert new col to the beginning
+    for w in width_list[::-1]:
+        e = OxmlElement('w:col')
+        e.set(qn('w:w'), str(int(20*w)))
+        e.set(qn('w:space'), str(int(20*space))) # basic unit 1/20 Pt
+        cols.insert(0, e)
+
+
 def delete_paragraph(paragraph):
     '''Delete a paragraph.
 
@@ -101,7 +141,21 @@ def set_char_scaling(p_run, scale:float=1.0):
         p_run (docx.text.run.Run): Proxy object wrapping <w:r> element.
         scale (float, optional): scaling factor. Defaults to 1.0.
     '''
-    p_run._r.get_or_add_rPr().insert(0, parse_xml(r'<w:w {} w:val="{}"/>'.format(nsdecls('w'), 100*scale)))
+    p_run._r.get_or_add_rPr().insert(0, 
+        parse_xml(r'<w:w {} w:val="{}"/>'.format(nsdecls('w'), 100*scale)))
+
+
+def set_char_spacing(p_run, space:float=1.0):
+    '''Set character spacing. 
+    
+    Manual operation in MS Word: Font | Advanced | Character Spacing | Spacing.
+    
+    Args:
+        p_run (docx.text.run.Run): Proxy object wrapping <w:r> element.
+        space (float, optional): Spacing value in Pt. Expand if positive else condense. Defaults to 1.0.
+    '''
+    p_run._r.get_or_add_rPr().insert(0, 
+        parse_xml(r'<w:spacing {} w:val="{}"/>'.format(nsdecls('w'), 20*space)))
 
 
 def set_char_shading(p_run, srgb:int):
@@ -198,17 +252,18 @@ def add_hyperlink(paragraph, url, text):
 # ---------------------------------------------------------
 # image properties
 # ---------------------------------------------------------
-def add_image(p, image_path_or_stream, width):
+def add_image(p, image_path_or_stream, width, height):
     ''' Add image to paragraph.
     
     Args:
         p (Paragraph): ``python-docx`` paragraph instance.
         image_path_or_stream (str, bytes): Image path or stream.
         width (float): Image width in Pt.
+        height (float): Image height in Pt.
     '''
     docx_span = p.add_run()
     try:
-        docx_span.add_picture(image_path_or_stream, width=Pt(width))
+        docx_span.add_picture(image_path_or_stream, width=Pt(width), height=Pt(height))
     except UnrecognizedImageError:
         print('Unrecognized Image.')
         return

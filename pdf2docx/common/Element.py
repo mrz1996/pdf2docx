@@ -2,14 +2,18 @@
 
 '''Object with a bounding box, e.g. Block, Line, Span.
 
-Based on ``PyMuPDF``, the coordinates are provided relative to the un-rotated page; while this
-``pdf2docx`` library works under real page coordinate system, i.e. with rotation considered. 
-So, any instances created by this Class are always applied a rotation matrix automatically.
+Based on ``PyMuPDF``, the coordinates (e.g. bbox of ``page.getText('rawdict')``) are generally 
+provided relative to the un-rotated page; while this ``pdf2docx`` library works under real page 
+coordinate system, i.e. with rotation considered. So, any instances created by this Class are 
+always applied a rotation matrix automatically.
 
-In other words, the bbox parameter used to create ``Element`` instance MUST be relative to un-rotated
+Therefore, the bbox parameter used to create ``Element`` instance MUST be relative to un-rotated
 CS. If final coordinates are provided, should update it after creating an empty object::
 
     Element().update_bbox(final_bbox)
+
+.. note::
+    An exception is ``page.getDrawings()``, the coordinates are converted to real page CS already.
 '''
 
 import copy
@@ -50,8 +54,7 @@ class Element(IText):
         self._parent = parent # type: Element
 
         # NOTE: Any coordinates provided in raw is in original page CS (without considering page rotation).
-        if raw is None: raw = {}
-        if 'bbox' in raw:
+        if 'bbox' in (raw or {}):
             rect = fitz.Rect(raw['bbox']) * Element.ROTATION_MATRIX
             self.update_bbox(rect)
 
@@ -136,12 +139,14 @@ class Element(IText):
 
         Returns:
             bool: [description]
-        """        
+        """
+        # NOTE the case bool(e)=True but e.bbox.getArea()=0
+        S = e.bbox.getArea()
+        if not S: return False 
+        
         # it's not practical to set a general threshold to consider the margin, so two steps:
         # - set a coarse but acceptable area threshold,
         # - check the length in main direction strictly
-
-        if not e: return False
 
         # A contains B => A & B = B
         intersection = self.bbox & e.bbox
@@ -216,7 +221,8 @@ class Element(IText):
         L2 = e.bbox[idx+2]-e.bbox[idx]
         L = max(self.bbox[idx+2], e.bbox[idx+2]) - min(self.bbox[idx], e.bbox[idx])
 
-        return L1+L2-L>=factor*min(L1,L2)
+        eps = 1e-3 # tolerent
+        return L1+L2-L+eps >= factor*min(L1,L2)
 
 
     def horizontally_align_with(self, e, factor:float=0.0, text_direction:bool=True):
@@ -247,7 +253,9 @@ class Element(IText):
         L1 = self.bbox[idx+2]-self.bbox[idx]
         L2 = e.bbox[idx+2]-e.bbox[idx]
         L = max(self.bbox[idx+2], e.bbox[idx+2]) - min(self.bbox[idx], e.bbox[idx])
-        return L1+L2-L>=factor*min(L1,L2)
+
+        eps = 1e-3 # tolerent
+        return L1+L2-L+eps >= factor*min(L1,L2)
 
 
     def in_same_row(self, e):

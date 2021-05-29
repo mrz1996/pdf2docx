@@ -27,8 +27,8 @@ Data structure based on this `link <https://pymupdf.readthedocs.io/en/latest/tex
 
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-
 from .Lines import Lines
+from ..image.ImageSpan import ImageSpan
 from ..common.share import RectType, TextDirection, TextAlignment
 from ..common.Block import Block
 from ..common.share import rgb_component_from_name
@@ -39,7 +39,7 @@ from ..common import docx
 class TextBlock(Block):
     '''Text block.'''
     def __init__(self, raw:dict=None):
-        if raw is None: raw = {}
+        raw = raw or {}
         
         # remove key 'bbox' since it is calculated from contained lines
         if 'bbox' in raw: raw.pop('bbox') 
@@ -54,9 +54,9 @@ class TextBlock(Block):
 
     @property
     def text(self):
-        '''Get text content in block, joning each line with ``\\n``.'''
+        '''Text content in block.'''
         lines_text = [line.text for line in self.lines]
-        return '\n'.join(lines_text)
+        return ''.join(lines_text)
 
     
     @property
@@ -72,6 +72,29 @@ class TextBlock(Block):
             return list(res)[0]
         else:
             return TextDirection.LEFT_RIGHT
+
+
+    @property
+    def average_row_gap(self):
+        '''Average distance between adjacent two physical rows.'''
+        idx = 1 if self.is_horizontal_text else 0
+        rows = self.lines.group_by_physical_rows()
+        num = len(rows)
+
+        # no gap if single row
+        if num==1: return None
+        
+        # multi-lines block
+        block_height = self.bbox[idx+2]-self.bbox[idx]
+        f_max_row_height = lambda row: max(abs(line.bbox[idx+2]-line.bbox[idx]) for line in row)
+        sum_row_height = sum(map(f_max_row_height, rows))
+        return (block_height-sum_row_height) / (num-1)
+    
+
+    @property
+    def row_count(self):
+        '''Count of physical rows.'''
+        return len(self.lines.group_by_physical_rows())
 
 
     def is_flow_layout(self, *args):
@@ -96,9 +119,9 @@ class TextBlock(Block):
             self.lines.append(line_or_lines)
 
 
-    def strip(self):
+    def strip(self, delete_end_line_hyphen:bool):
         '''Strip each Line instance.'''
-        self.lines.strip()
+        self.lines.strip(delete_end_line_hyphen)
 
 
     def plot(self, page):
@@ -150,10 +173,12 @@ class TextBlock(Block):
 
     def parse_horizontal_spacing(self, bbox,
                     line_separate_threshold:float,
-                    line_free_space_ratio_threshold:float,
+                    line_break_width_ratio:float,
+                    line_break_free_space_ratio:float,
                     lines_left_aligned_threshold:float,
                     lines_right_aligned_threshold:float,
-                    lines_center_aligned_threshold:float):
+                    lines_center_aligned_threshold:float,
+                    condense_char_spacing:float):
         ''' Set horizontal spacing based on lines layout and page bbox.
         
         * The general spacing is determined by paragraph alignment and indentation.
@@ -167,19 +192,15 @@ class TextBlock(Block):
         # while vertical text is on the contrary, so use f = -1 here
         idx0, idx1, f = (0, 2, 1.0) if self.is_horizontal_text else (3, 1, -1.0)
         
-        # decide text alignment by internal lines in first priority; if can't decide, check
-        # with page layout.
-        int_alignment = self._internal_alignment((idx0, idx1, f),
-                        line_separate_threshold,
-                        lines_left_aligned_threshold,
-                        lines_right_aligned_threshold,
-                        lines_center_aligned_threshold)
-        ext_alignment = self._external_alignment(bbox,
-                        (idx0, idx1, f),
-                        lines_center_aligned_threshold)
-        self.alignment = int_alignment if int_alignment!=TextAlignment.UNKNOWN else ext_alignment
+        # text alignment
+        self.alignment = self._parse_alignment(bbox, 
+            (idx0, idx1, f),
+            line_separate_threshold,
+            lines_left_aligned_threshold,
+            lines_right_aligned_threshold,
+            lines_center_aligned_threshold)
 
-        # if still can't decide, set LEFT by default and ensure position by TAB stops
+        # if still can't decide, set LEFT by default and ensure position by TAB stops        
         if self.alignment == TextAlignment.NONE:
             self.alignment = TextAlignment.LEFT
 
@@ -188,53 +209,80 @@ class TextBlock(Block):
             fun = lambda line: round((line.bbox[idx0]-self.bbox[idx0])*f, 1) # relative position to block
             all_pos = set(map(fun, self.lines))
             self.tab_stops = list(filter(lambda pos: pos>=constants.MINOR_DIST, all_pos))
-            
-        # adjust left/right indentation to save tolerance space
-        if self.alignment == TextAlignment.LEFT:
-            self.left_space = self.left_space_total
-            self.right_space = min(self.left_space_total, self.right_space_total)
-        elif self.alignment == TextAlignment.RIGHT:
-            self.left_space = min(self.left_space_total, self.right_space_total)
-            self.right_space = self.right_space_total
-        elif self.alignment == TextAlignment.CENTER:
+        
+        # adjust left/right indentation:
+        # - set single side indentation if single line
+        # - add minor space if multi-lines
+        row_count = self.row_count
+        if row_count==1 and self.alignment == TextAlignment.LEFT:
+            self.right_space = 0
+
+        elif row_count==1 and self.alignment == TextAlignment.RIGHT:
+            self.left_space = 0
+        
+        elif row_count==1 and self.alignment == TextAlignment.CENTER:
             self.left_space = 0
             self.right_space = 0
-        else:
-            self.left_space = self.left_space_total
-            self.right_space = self.right_space_total
-
+        
         # parse line break
-        self.lines.parse_line_break(line_free_space_ratio_threshold)
+        self.lines.parse_line_break(bbox, 
+            line_break_width_ratio, 
+            line_break_free_space_ratio, 
+            condense_char_spacing)
 
 
-    def parse_line_spacing(self):
-        '''Calculate average line spacing.
+    def parse_relative_line_spacing(self):
+        '''Calculate relative line spacing, e.g. `spacing = 1.02`.  Relative line spacing is based on standard 
+        single line height, which is font-related. 
+
+        .. note::
+            The line spacing could be updated automatically when changing the font size, while the layout might
+            be broken in exact spacing mode, e.g. overlapping of lines.
+        '''
+        # return default line spacing if any images exists
+        for line in self.lines:
+            if list(span for span in line.spans if isinstance(span, ImageSpan)):
+                self.line_space = constants.DEFULT_LINE_SPACING
+                return
+
+        # otherwise, calculate average line spacing
+        idx = 1 if self.is_horizontal_text else 0
+        block_height = self.bbox[idx+2]-self.bbox[idx]
+        
+        # An approximate expression: 
+        # standard_line_height * relative_line_spacing = block_height
+        rows = self.lines.group_by_physical_rows()        
+        fun_max_line_height = lambda line: max(span.line_height for span in line.spans)
+        fun_max_row_height = lambda row: max(fun_max_line_height(line) for line in row)
+        standard_height = sum(fun_max_row_height(row) for row in rows)
+        line_space = block_height/standard_height
+
+        # overlap may exist when multi-rows, so set minimum spacing  -> default spacing
+        if len(rows)>1: line_space = max(line_space, constants.DEFULT_LINE_SPACING)
+        self.line_space = line_space
+
+
+    def parse_exact_line_spacing(self):
+        '''Calculate exact line spacing, e.g. `spacing = Pt(12)`. 
 
         The layout of pdf text block: line-space-line-space-line, excepting space before first line, 
         i.e. space-line-space-line, when creating paragraph in docx. So, an average line height is 
-        ``space+line``.
+        ``space+line``. Then, the height of first line can be adjusted by updating paragraph before-spacing.
 
-        Then, the height of first line can be adjusted by updating paragraph before-spacing.
+        .. note::
+            Compared with the relative spacing mode, it has a more precise layout, but less flexible editing
+            ability, especially changing the font size.
         '''
 
         # check text direction
-        idx = 1 if self.is_horizontal_text else 0
+        idx = 1 if self.is_horizontal_text else 0       
 
-        ref_line = None
-        count = 0
-
-        for line in self.lines:
-            # count of lines
-            if not line.in_same_row(ref_line): count += 1
-
-            # update reference line
-            ref_line = line            
-        
         bbox = self.lines[0].bbox   # first line
         first_line_height = bbox[idx+2] - bbox[idx]
         block_height = self.bbox[idx+2]-self.bbox[idx]
         
         # average line spacing
+        count = self.row_count # count of rows
         if count > 1:
             line_space = (block_height-first_line_height)/(count-1)
         else:
@@ -267,7 +315,6 @@ class TextBlock(Block):
             The left position of paragraph is set by paragraph indent, rather than ``TAB`` stop.
         '''
         pf = docx.reset_paragraph_format(p)
-
         # vertical spacing
         before_spacing = max(round(self.before_space, 1), 0.0)
         after_spacing = max(round(self.after_space, 1), 0.0)
@@ -276,7 +323,8 @@ class TextBlock(Block):
         pf.space_after = Pt(after_spacing)        
 
         # line spacing
-        pf.line_spacing = Pt(round(self.line_space, 1))
+        pf.line_spacing = round(self.line_space, 2)
+
 
         # horizontal alignment
         # - alignment mode
@@ -285,17 +333,22 @@ class TextBlock(Block):
             # set tab stops to ensure line position
             for pos in self.tab_stops:
                 pf.tab_stops.add_tab_stop(Pt(self.left_space + pos))
+
         elif self.alignment==TextAlignment.RIGHT:
             pf.alignment = WD_ALIGN_PARAGRAPH.RIGHT            
 
         elif self.alignment==TextAlignment.CENTER:
             pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
         else:
             pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
         # - paragraph indentation
-        # NOTE: first-line-indent should be excluded
-        pf.left_indent  = Pt(self.left_space-self.first_line_space)
+        # NOTE: different left spacing setting in case first line indent and hanging
+        if self.first_line_space<0: # hanging
+            pf.left_indent  = Pt(self.left_space-self.first_line_space)
+        else: # first line indent
+            pf.left_indent  = Pt(self.left_space)
         pf.right_indent  = Pt(self.right_space)
 
         # - first line indentation
@@ -308,29 +361,40 @@ class TextBlock(Block):
 
 
 
-    def _internal_alignment(self, text_direction_param:tuple, 
+    def _parse_alignment(self, bbox,
+                    text_direction_param:tuple, 
                     line_separate_threshold:float,
                     lines_left_aligned_threshold:float,
                     lines_right_aligned_threshold:float,
                     lines_center_aligned_threshold:float):
-        '''Detect text alignment mode based on layout of internal lines. 
+        '''Detect text alignment mode based on layout of internal lines. It can't decide when only
+        one line, in such case, the alignment mode is determined by externally check.
         
         Args:
             text_direction_param (tuple): ``(x0_index, x1_index, direction_factor)``, 
                 e.g. ``(0, 2, 1)`` for horizontal text, while ``(3, 1, -1)`` for vertical text.
         '''
-        # get lines in each physical row
-        fun = lambda a,b: a.in_same_row(b)
-        rows = self.lines.group(fun)
-
         # indexes based on text direction
         idx0, idx1, f = text_direction_param
 
+        # check external position: text block to parent layout
+        d_left   = round((self.bbox[idx0]-bbox[idx0])*f, 1) # left margin
+        d_right  = round((bbox[idx1]-self.bbox[idx1])*f, 1) # right margin
+        d_center = round((d_left-d_right)/2.0, 1)           # center margin
+        d_left   = max(d_left, 0.0)
+        d_right  = max(d_right, 0.0)
+        W = abs(bbox[idx1]-bbox[idx0]) # bbox width
+
+        # NOTE: set horizontal space
+        self.left_space  = d_left
+        self.right_space = d_right
+
         # --------------------------------------------------------------------------
-        # First priority: significant distance exists in any two adjacent lines ->
-        # set unknown alignment temporarily. Assign left-align to it later and ensure
-        # exact position of each line by TAB stop. 
+        # First priority: 
+        # significant distance exists in any two adjacent lines -> set NONE temporarily. 
+        # Assign left-align to it later and ensure exact position of each line by TAB stop. 
         # --------------------------------------------------------------------------
+        rows = self.lines.group_by_physical_rows() # lines in each physical row
         for row in rows:
             if len(row)==1: continue
             dis = [(row[i].bbox[idx0]-row[i-1].bbox[idx1])*f>=line_separate_threshold \
@@ -338,11 +402,23 @@ class TextBlock(Block):
             if any(dis):
                 return TextAlignment.NONE
 
-        # just one row -> can't decide -> full possibility
-        if len(rows) < 2: return TextAlignment.UNKNOWN
+        # --------------------------------------------------------------------------
+        # determined by position to external bbox if one line only
+        # the priority: center > left > right
+        # --------------------------------------------------------------------------
+        # |    ============    | -> center
+        # |   ================ | -> left
+        # |        =========== | -> right
+        if len(rows) == 1: 
+            if abs(d_center) < lines_center_aligned_threshold: 
+                return TextAlignment.CENTER
+            elif d_left <= 0.25*W:
+                return TextAlignment.LEFT
+            else:
+                return TextAlignment.RIGHT
 
         # --------------------------------------------------------------------------
-        # Then check alignment of internal lines:
+        # Check alignment of internal lines:
         # When count of lines >= 3:
         # - left-alignment based on lines excepting the first line
         # - right-alignment based on lines excepting the last line
@@ -363,44 +439,21 @@ class TextBlock(Block):
 
         if left_aligned and right_aligned:
             # need further external check if two lines only
-            return TextAlignment.JUSTIFY if len(rows)>=3 else TextAlignment.UNKNOWN
+            if len(rows)>=3 or (d_left+d_right)/W < constants.FACTOR_A_FEW:
+                self.first_line_space = rows[0][0].bbox[idx0] - rows[1][0].bbox[idx0]
+                return TextAlignment.JUSTIFY
+            else:
+                return TextAlignment.CENTER
+
+        elif center_aligned:
+            return TextAlignment.CENTER
+
         elif left_aligned:
             self.first_line_space = rows[0][0].bbox[idx0] - rows[1][0].bbox[idx0]
             return TextAlignment.LEFT
+
         elif right_aligned:
             return TextAlignment.RIGHT
-        elif center_aligned:
-            return TextAlignment.CENTER
+
         else:
             return TextAlignment.NONE
-
-
-    def _external_alignment(self, bbox:list, 
-            text_direction_param:tuple,
-            lines_center_aligned_threshold:float):
-        '''Detect text alignment mode based on the position to external bbox. 
-        
-        Args:
-            bbox (list): Page or Cell bbox where this text block locates in.
-            text_direction_param (tuple): ``(x0_index, x1_index, direction_factor)``, e.g. 
-                ``(0, 2, 1)`` for horizontal text, while ``(3, 1, -1)`` for vertical text.
-        '''
-        # indexes based on text direction
-        idx0, idx1, f = text_direction_param
-
-        # distance to the bbox
-        d_left   = round((self.bbox[idx0]-bbox[idx0])*f, 1) # left margin
-        d_right  = round((bbox[idx1]-self.bbox[idx1])*f, 1) # right margin
-        d_center = round((d_left-d_right)/2.0, 1)           # center margin
-        d_left   = max(d_left, 0.0)
-        d_right  = max(d_right, 0.0)
-
-        # NOTE: set horizontal space
-        self.left_space_total  = d_left
-        self.right_space_total = d_right
-
-        # block location: left/center/right
-        if abs(d_center) < lines_center_aligned_threshold: 
-            return TextAlignment.CENTER
-        else:
-            return TextAlignment.LEFT if abs(d_left) <= abs(d_right) else TextAlignment.RIGHT

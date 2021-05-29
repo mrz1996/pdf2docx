@@ -5,11 +5,11 @@
 
 from .Shape import Shape, Stroke, Fill, Hyperlink
 from ..common.share import RectType, lazyproperty
-from ..common.Collection import Collection
+from ..common.Collection import Collection, ElementCollection
 from ..common import share
 
 
-class Shapes(Collection):
+class Shapes(ElementCollection):
     ''' A collection of ``Shape`` instances: ``Stroke`` or ``Fill``.'''
     def __init__(self, instances:list=None, parent=None):
         
@@ -18,11 +18,11 @@ class Shapes(Collection):
         # properties for context type of shape, e.g. 
         # a Stroke instace may be either table border or text underline or strike-through,
         # a Fill instance may be either cell shading or text highlight.
-        self._table_strokes = Collection()
-        self._table_fillings = Collection()
+        self._table_strokes = ElementCollection()
+        self._table_fillings = ElementCollection()
 
-        self._text_underlines_strikes = Collection() # they're combined at this moment
-        self._text_highlights = Collection()
+        self._text_underlines_strikes = ElementCollection() # they're combined at this moment
+        self._text_highlights = ElementCollection()
 
 
     def restore(self, raws:list):
@@ -103,9 +103,10 @@ class Shapes(Collection):
     def clean_up(self, max_border_width:float, shape_merging_threshold:float, shape_min_dimension:float):
         """Clean rectangles.
 
-        * Delete rectangles fully contained in another one (beside, they have same bg-color).
-        * Join intersected and horizontally aligned rectangles with same height and bg-color.
-        * Join intersected and vertically aligned rectangles with same width and bg-color.
+        * Delete small shapes (either width or height).
+        * Delete shapes out of page.
+        * Merge shapes with same filling color and significant overlap.
+        * Detect semantic type.
 
         Args:
             max_border_width (float): The max border width.
@@ -113,9 +114,6 @@ class Shapes(Collection):
             shape_min_dimension (float): Ignore shape if both width and height is lower than this value.
         """
         if not self._instances: return
-        
-        # sort in reading order
-        self.sort_in_reading_order()
 
         # clean up shapes:
         # - remove shapes out of page
@@ -123,35 +121,31 @@ class Shapes(Collection):
         page_bbox = self.parent.bbox
         f = lambda shape: shape.bbox.intersects(page_bbox) and \
                         (shape.bbox.width>=shape_min_dimension or shape.bbox.height>=shape_min_dimension)
-        shapes = filter(f, self._instances)
+        cleaned_shapes = list(filter(f, self._instances))
 
-        # merge shapes if same filling color and significant overlap
-        shapes_unique = [] # type: list [Shape]
-        for shape in shapes:
-            for ref_shape in shapes_unique:
-                # Do nothing if these two shapes in different bg-color
-                if ref_shape.color!=shape.color: continue
-
-                # add hyperlink as it is
-                if shape.type==RectType.HYPERLINK or ref_shape.type==RectType.HYPERLINK: continue
-
-                main_bbox = shape.get_main_bbox(ref_shape, threshold=shape_merging_threshold)
-                if main_bbox:
-                    ref_shape.update_bbox(main_bbox)
-                    break            
-            else:
-                shapes_unique.append(shape)
+        # merge normal shapes if same filling color and significant overlap        
+        merged_shapes = []
+        normal_shapes = list(filter(
+            lambda shape: shape.type==RectType.UNDEFINED, cleaned_shapes))        
+        f = lambda a, b: a.color==b.color and (
+            a.get_main_bbox(b, threshold=shape_merging_threshold) or \
+            b.get_main_bbox(a, threshold=shape_merging_threshold))        
+        for group in Collection(normal_shapes).group(f):
+            merged_shapes.append(group[0].update_bbox(group.bbox))
+        
+        # add hyperlinks
+        hyperlinks = filter(lambda shape: shape.type==RectType.HYPERLINK, cleaned_shapes)
+        merged_shapes.extend(hyperlinks)
                 
         # convert Fill instance to Stroke if looks like stroke
         shapes = []
-        for shape in shapes_unique:
+        for shape in merged_shapes:
             if isinstance(shape, Fill):
                 stroke = shape.to_stroke(max_border_width)
                 shapes.append(stroke if stroke else shape)
             else:
                 shapes.append(shape)
-
-        self.reset(shapes)
+        self.reset(shapes).sort_in_reading_order() # sort in reading order
 
 
     def detect_initial_categories(self):
@@ -162,9 +156,6 @@ class Shapes(Collection):
             the gap between borders and underlines/strikes are very close, which leads
             to an incorrect table structure. So, it's required to distinguish them in
             advance, though we needn't to ensure 100% accuracy.
-
-        .. note::
-            It should be run right after ``clean_up()``.
         '''
         # reset all
         self._table_strokes.reset()
@@ -172,16 +163,16 @@ class Shapes(Collection):
         self._text_underlines_strikes.reset()
         self._text_highlights.reset()
 
-        # all blocks in page (the original blocks without any further processing)
+        # blocks in page (the original blocks without any further processing)
         blocks = self._parent.blocks
         blocks.sort_in_reading_order()
 
-        # check positions between shapes and blocks
+        # check positions between shapes and text blocks
         for shape in self._instances:
             # try to determin shape semantic type:
             # - check if text underline/strike for a stroke
             # - check if table shading for a fill
-            rect_type = shape.semantic_type(blocks)     # type: RectType
+            rect_type = shape.semantic_type(blocks.text_blocks)     # type: RectType
 
             # set the type if succeeded
             if rect_type==RectType.HYPERLINK:

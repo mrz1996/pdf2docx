@@ -22,8 +22,7 @@ Terms definition:
 from ..common import constants
 from ..common.Element import Element
 from ..common.Collection import Collection
-from ..page.Blocks import Blocks
-from ..shape.Shape import Stroke
+from ..layout.Blocks import Blocks
 from ..shape.Shapes import Shapes
 from ..text.Lines import Lines
 from .TableStructure import TableStructure
@@ -37,63 +36,6 @@ class TablesConstructor:
         self._parent = parent # Layout
         self._blocks = parent.blocks # type: Blocks
         self._shapes = parent.shapes # type: Shapes
-
-
-    def page_layout_table(self):
-        '''Set page layout if two-columns layout.
-
-        ::
-            +------------|--------------+ span_elements
-            +------------|--------------+
-                         |
-            +----------+ | +------------+ v0
-            |  column  | | |  elements  | 
-            +----------+ | +------------+ v1
-            u0           |             u1
-            +------------|--------------+ 
-            +------------|--------------+ span_elements
-                         |
-
-        .. note::
-            Run this method in Page level only, right after cleaning blocks and shapes.
-        '''
-        # collect all lines and shapes
-        elements = Collection()
-        for block in self._blocks: elements.extend(block.lines)
-        for shape in self._shapes: elements.append(shape)
-        
-        # filter with page center line
-        x0, y0, x1, y1 = self._parent.bbox
-        X = (x0+x1) / 2.0
-        column_elements = list(filter(
-                lambda line: line.bbox[2]<X or line.bbox[0]>X, elements))
-        span_elements = filter(
-                lambda line: line.bbox[2]>=X>=line.bbox[0], elements)
-        
-        # check: intersected elements must on the top or bottom side
-        u0, v0, u1, v1 = Collection(column_elements).bbox
-        if not all(e.bbox[3]<v0 or e.bbox[1]>v1 for e in span_elements): return
-
-        # create dummy strokes for table parsing        
-        m0, m1 = (x0+u0)/2.0, (x1+u1)/2.0
-        n0, n1 = v0-constants.MAJOR_DIST, v1+constants.MAJOR_DIST        
-        strokes = [
-            Stroke({'start': (m0, n0), 'end': (m1, n0)}), # top
-            Stroke({'start': (m0, n1), 'end': (m1, n1)}), # bottom
-            Stroke({'start': (m0, n0), 'end': (m0, n1)}), # left
-            Stroke({'start': (m1, n0), 'end': (m1, n1)}), # right
-            Stroke({'start': (X, n0), 'end': (X, n1)})]   # center
-        
-        # parse table structure
-        table = TableStructure(strokes).parse([]).to_table_block()
-        tables = []
-        if table:
-            table.set_stream_table_block()
-            tables.append(table)
-
-        # assign blocks/shapes to each table
-        self._blocks.assign_to_tables(tables)
-        self._shapes.assign_to_tables(tables)
 
 
     def lattice_tables(self, 
@@ -238,30 +180,29 @@ class TablesConstructor:
             # NOTE: shading with any intersections should be counted to avoid missing any candidates
             explicit_shadings, _ = table_fillings.split_with_intersection(rect.bbox) 
 
+            # NOTE: ignore one-row / one-column table and has no explicit shading
+            if not explicit_shadings and (
+                len(table_lines.group_by_physical_rows())==1 or len(table_lines.group_by_columns())==1): continue
+
             # parse stream borders based on lines in cell and explicit borders/shadings
-            strokes = self.stream_strokes(table_lines, outer_borders, explicit_strokes, explicit_shadings)
+            strokes = self._stream_strokes(table_lines, outer_borders, explicit_strokes, explicit_shadings)
             if not strokes: continue
 
             # parse table structure
             strokes.sort_in_reading_order() # required
             table = TableStructure(strokes, settings).parse(explicit_shadings).to_table_block()
 
-            # NOTE: ignore stream table with only one column since it's of no use;
-            #       but when it has an explicit background, accept it.
-            if table.num_cols>1 or any(row[0].bg_color for row in table): 
-                table.set_stream_table_block()
-                tables.append(table)            
+            table.set_stream_table_block()
+            tables.append(table)
 
         # assign blocks/shapes to each table
         self._blocks.assign_to_tables(tables)
         self._shapes.assign_to_tables(tables)
-
-        # NOTE: set blocks in current level back to original layout if possible
-        self._blocks.split_back(float_layout_tolerance, line_separate_threshold)        
+        
 
 
     @staticmethod
-    def stream_strokes(lines:Lines, outer_borders:tuple, explicit_strokes:Shapes, explicit_shadings:Shapes):
+    def _stream_strokes(lines:Lines, outer_borders:tuple, explicit_strokes:Shapes, explicit_shadings:Shapes):
         '''Parsing borders mainly based on content lines contained in cells, 
         and update borders (position and style) with explicit borders represented 
         by rectangle shapes.
@@ -359,7 +300,7 @@ class TablesConstructor:
         '''
         # trying: deep into cells        
         cols_lines = lines.group_by_columns()
-        group_lines = [col_lines.group_by_rows() for col_lines in cols_lines]
+        group_lines = [col_lines.group_by_rows(factor=constants.FACTOR_A_FEW) for col_lines in cols_lines]
 
         # horizontal borders are for reference only when n_column<=2 -> 
         # consider 1-column or 2-columns text layout
@@ -390,7 +331,7 @@ class TablesConstructor:
                     border_range=(x0, x1), 
                     borders=(TOP, BOTTOM), 
                     reference=False) # vertical border always valuable
-                borders.add(right) # right border of current column            
+                borders.append(right) # right border of current column            
             
             # NOTE: unnecessary to split row if the count of row is 1
             rows_lines = group_lines[i]
@@ -417,7 +358,7 @@ class TablesConstructor:
                         border_range=(y0, y1), 
                         borders=(left, right), 
                         reference=is_reference)
-                    borders.add(bottom)
+                    borders.append(bottom)
 
                 # recursion to check borders further
                 borders_ = TablesConstructor._inner_borders(rows_lines[j], (top, bottom, left, right))
